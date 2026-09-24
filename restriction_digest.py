@@ -8,6 +8,10 @@
 * 片段按上链切口排序（环状循环排序，线性追加分子两端 0/N 的平端边界）。
 * 当交错切口导致片段无法做无交叉的简单归属时，抛出
   :class:`DigestUnsupportedError`，绝不猜测配对。
+* 在此之上提供候选**环状切位图**与完全消化片段长度多重集的匹配
+  （:class:`CutMap` / :func:`match_candidates`）：长度精确比较、
+  旋转等价去重；切位图也可由 :func:`map_from_digest` 复用上面的
+  旧切割规则生成。
 
 全部计算均为整数运算，没有浮点输出，因此不存在误差口径/容差问题。
 """
@@ -15,6 +19,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass
 from typing import Final, Iterable, Union
 
@@ -26,13 +31,19 @@ __all__ = [
     "EnzymeDefinitionError",
     "SequenceError",
     "DigestUnsupportedError",
+    "CandidateError",
     "Enzyme",
     "EndInfo",
     "Fragment",
     "CutSite",
     "DigestResult",
+    "CutMap",
+    "MatchResult",
     "compatible",
     "digest",
+    "circular_fragment_lengths",
+    "map_from_digest",
+    "match_candidates",
 ]
 
 MAX_BASES: Final[int] = 5000
@@ -88,6 +99,10 @@ class SequenceError(DigestError):
 
 class DigestUnsupportedError(DigestError):
     """输入合法，但交错切口产生非简单片段，本契约明确拒绝猜测配对。"""
+
+
+class CandidateError(DigestError):
+    """候选切位图/片段长度多重集非法（含可定位的下标信息）。"""
 
 
 # ---------------------------------------------------------------------------
@@ -578,3 +593,258 @@ def digest(
         ))
 
     return DigestResult(topology, n, cut_sites, tuple(fragments))
+
+
+# ---------------------------------------------------------------------------
+# 候选环状切位图 × 完全消化片段长度多重集
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CutMap:
+    """一个候选环状切位图：环长 ``length`` 与升序、不重复的切口边界。
+
+    边界 k 位于第 k-1 与第 k 个碱基之间（与 :class:`Enzyme` 的切偏移
+    约定一致），取值 ``0..length-1``；环上坐标只相差旋转时视为同一张图。
+
+    * 0 个切口表示**未切环**：完全消化后仍是一整个环（一个长度 length
+      的环状片段）。
+    * 1 个切口表示**单切环**：完全消化后得到一个长度 length 的线性片段。
+      两者长度多重集都是 ``(length,)``，但切口数不同，因此互不等价、
+      分别作为候选保留（去重键含切口数）。
+    """
+
+    length: int
+    cuts: tuple[int, ...]
+    label: str = ""
+
+    def __post_init__(self) -> None:
+        length = _check_map_length(self.length)
+        cuts, label = _check_map_parts(self.cuts, self.label, length)
+        object.__setattr__(self, "length", length)
+        object.__setattr__(self, "cuts", cuts)
+        object.__setattr__(self, "label", label)
+
+    @property
+    def cut_count(self) -> int:
+        return len(self.cuts)
+
+    @property
+    def is_uncut(self) -> bool:
+        """是否为未切环（0 个切口）。"""
+        return not self.cuts
+
+    def fragment_lengths(self) -> tuple[int, ...]:
+        """完全消化后的片段长度元组（按切口升序的循环序，非多重集排序）。"""
+        return circular_fragment_lengths(self.length, self.cuts)
+
+
+@dataclass(frozen=True)
+class MatchResult:
+    """候选匹配结果。
+
+    * ``matches``：与片段长度多重集匹配的候选，已做**旋转等价去重**，
+      保留每个等价类中先出现的候选（输入顺序）。
+    * ``examined``：去重前检查过的候选总数。
+    * ``unique_classes``：参与匹配的全部候选（含不匹配的）按旋转归一化
+      后的等价类数量，即去重后的候选数。
+    """
+
+    matches: tuple[CutMap, ...]
+    examined: int
+    unique_classes: int
+
+    @property
+    def matched(self) -> bool:
+        """是否至少存在一个匹配候选。"""
+        return bool(self.matches)
+
+
+def _check_map_length(value: object) -> int:
+    """切位图环长：拒绝 bool/float（含 NaN/Inf），要求 >= 1。"""
+    if isinstance(value, bool):
+        raise CandidateError("length 不能是 bool 类型，必须是 int")
+    if isinstance(value, int):
+        if value < 1:
+            raise CandidateError(f"length 必须 >= 1，收到 {value}")
+        return value
+    if isinstance(value, float):
+        if math.isnan(value):
+            raise CandidateError("length 不能是 NaN，必须是有限正整数")
+        if math.isinf(value):
+            raise CandidateError("length 不能是 Infinity，必须是有限正整数")
+        raise CandidateError(f"length 必须是 int，收到 float: {value!r}")
+    raise CandidateError(f"length 必须是 int，收到 {type(value).__name__}")
+
+
+def _check_map_parts(
+    cuts: object, label: object, length: int
+) -> tuple[tuple[int, ...], str]:
+    if isinstance(label, bool) or not isinstance(label, str):
+        raise CandidateError(f"label 必须是 str，收到 {type(label).__name__}")
+    if isinstance(cuts, (str, bytes)) or not isinstance(cuts, Iterable):
+        raise CandidateError(
+            f"cuts 必须是 int 可迭代对象，收到 {type(cuts).__name__}"
+        )
+    norm: list[int] = []
+    for i, c in enumerate(cuts):
+        if isinstance(c, bool):
+            raise CandidateError(f"cuts[{i}] 不能是 bool，必须是 int")
+        if not isinstance(c, int):
+            if isinstance(c, float):
+                raise CandidateError(f"cuts[{i}] 必须是 int，收到 float: {c!r}")
+            raise CandidateError(
+                f"cuts[{i}] 必须是 int，收到 {type(c).__name__}"
+            )
+        if not 0 <= c < length:
+            raise CandidateError(
+                f"cuts[{i}] = {c} 超出环长 {length} 的切口边界范围 "
+                f"[0, {length - 1}]"
+            )
+        if norm and c <= norm[-1]:
+            # 升序且不重复；显式报错便于定位（不静默排序/去重）。
+            raise CandidateError(
+                f"cuts[{i}] = {c} 不满足严格升序/不重复"
+                f"（前一个切口为 {norm[-1]}）；切口必须显式、升序、不重复"
+            )
+        norm.append(c)
+    return tuple(norm), label
+
+
+def circular_fragment_lengths(
+    length: int, cuts: Iterable[int]
+) -> tuple[int, ...]:
+    """环长 ``length``、切口升序 ``cuts`` 的完全消化片段长度元组。
+
+    切口 p0 < p1 < ... < p(k-1) 把环分成 k 段，循环序长度为
+    ``(p1-p0, p2-p1, ..., length-p(k-1)+p0)``；0 个切口时整环未切，
+    返回 ``(length,)``。长度为精确整数，调用方做多重集比较。
+    """
+    n = _check_map_length(length)
+    pts, _ = _check_map_parts(cuts, "", n)
+    if not pts:
+        return (n,)
+    gaps = [pts[i + 1] - pts[i] for i in range(len(pts) - 1)]
+    gaps.append(n - pts[-1] + pts[0])
+    return tuple(gaps)
+
+
+def _rotation_key(n: int, cuts: tuple[int, ...]) -> tuple[int, ...]:
+    """旋转等价归一化键：间隙循环序列的字典序最小移位（前面补切口数）。
+
+    环旋转只改变切口的绝对坐标，不改变相邻切口的循环间隙序列；
+    补上切口数是为了让“未切环”和“单切环”（间隙同为 (n,)）不会被
+    错误地归为同一个等价类。
+    """
+    if not cuts:
+        return (0,)
+    gaps = circular_fragment_lengths(n, cuts)
+    k = len(gaps)
+    best = gaps
+    for i in range(1, k):
+        rot = gaps[i:] + gaps[:i]
+        if rot < best:
+            best = rot
+    return (k, *best)
+
+
+def map_from_digest(result: DigestResult) -> CutMap:
+    """从环状 :func:`digest` 结果提取候选切位图（复用旧切割规则）。
+
+    取去重后的物理断裂上链边界（模环长）；线性 ``DigestResult`` 不适用
+    （本功能只处理环状候选），分子天然末端不是酶切口。
+    """
+    if not isinstance(result, DigestResult):
+        raise CandidateError(
+            f"result 必须是 DigestResult，收到 {type(result).__name__}"
+        )
+    if result.topology != "circular":
+        raise CandidateError(
+            f"map_from_digest 只接受环状 DigestResult，收到 topology="
+            f"{result.topology!r}"
+        )
+    cuts = tuple(sorted({s.top_boundary for s in result.cut_sites}))
+    return CutMap(result.length, cuts)
+
+
+def match_candidates(
+    observed: Iterable[int], candidates: Iterable[CutMap]
+) -> MatchResult:
+    """在候选环状切位图中找出与完全消化片段长度多重集匹配者。
+
+    :param observed: 完全消化测得的片段长度多重集（顺序无关，可重复），
+        每个长度必须是正整数。
+    :param candidates: 候选 :class:`CutMap` 可迭代对象；先全部校验、
+        归一化，再开始匹配，任何一个非法都整体抛出 :class:`CandidateError`，
+        不产生半更新结果（本函数无内部状态，失败即无返回值）。
+    :returns: :class:`MatchResult`；匹配标准是长度多重集**精确相等**
+        （``Counter`` 比较，不容差），并对候选做旋转等价去重：
+        同一旋转等价类只保留先出现者；未切环与单切环不作为等价类合并。
+
+    穷举小规模候选，无预算/超时路径；“无匹配”是被证明的结果。
+    """
+    if isinstance(observed, (str, bytes)) or not isinstance(observed, Iterable):
+        raise CandidateError(
+            f"observed 必须是 int 可迭代对象，收到 {type(observed).__name__}"
+        )
+    target_counter: Counter[int] = Counter()
+    total = 0
+    for i, x in enumerate(observed):
+        if isinstance(x, bool):
+            raise CandidateError(f"observed[{i}] 不能是 bool，必须是正整数")
+        if not isinstance(x, int):
+            if isinstance(x, float):
+                if math.isnan(x):
+                    raise CandidateError(f"observed[{i}] 不能是 NaN")
+                if math.isinf(x):
+                    raise CandidateError(f"observed[{i}] 不能是 Infinity")
+                raise CandidateError(
+                    f"observed[{i}] 必须是 int，收到 float: {x!r}"
+                )
+            raise CandidateError(
+                f"observed[{i}] 必须是 int，收到 {type(x).__name__}"
+            )
+        if x <= 0:
+            raise CandidateError(
+                f"observed[{i}] = {x} 不是正整数：片段长度必须 >= 1"
+            )
+        target_counter[x] += 1
+        total += x
+    if not target_counter:
+        raise CandidateError(
+            "observed 不能为空：完全消化至少产生一个片段"
+            "（未切环请给 [环长]）"
+        )
+
+    if isinstance(candidates, (str, bytes)) or not isinstance(candidates, Iterable):
+        raise CandidateError(
+            f"candidates 必须是 CutMap 可迭代对象，收到 {type(candidates).__name__}"
+        )
+    # 先物化并让每个 CutMap 完成自身校验（构造时即校验），保证“全部校验
+    # 通过后才匹配”的原子语义；惰性生成器也在此刻被完整消费一次。
+    try:
+        cand_list = list(candidates)
+    except CandidateError:
+        raise
+    except TypeError as exc:
+        raise CandidateError(f"candidates 迭代失败：{exc}") from exc
+    for i, cand in enumerate(cand_list):
+        if not isinstance(cand, CutMap):
+            raise CandidateError(
+                f"candidates[{i}] 不是 CutMap 实例（类型 {type(cand).__name__}）"
+            )
+
+    seen: set[tuple[int, ...]] = set()
+    matches: list[CutMap] = []
+    examined = 0
+    for cand in cand_list:
+        examined += 1
+        key = _rotation_key(cand.length, cand.cuts)
+        if key in seen:
+            continue  # 与先前候选旋转等价：去重，不重复列入匹配
+        seen.add(key)
+        # Counter 相等已蕴含长度总和（=环长）相等；total 仅用于早筛。
+        if cand.length == total and Counter(cand.fragment_lengths()) == target_counter:
+            matches.append(cand)
+
+    return MatchResult(tuple(matches), examined, len(seen))

@@ -5,10 +5,14 @@
 """
 
 from restriction_digest import (
+    CandidateError,
+    CutMap,
     DigestUnsupportedError,
     Enzyme,
     compatible,
     digest,
+    map_from_digest,
+    match_candidates,
 )
 
 
@@ -54,6 +58,64 @@ def main():
         print(f"  片段{f.index}: 上链 {f.top_strand} / 下链 {f.bottom_strand}；"
               f"左 {f.left_end.kind}，右 {f.right_end.kind}")
     print(f"  相邻端可拼接: {compatible(r2.fragments[0].right_end, r2.fragments[1].left_end)}")
+
+    print()
+    print("=" * 70)
+    print("新能力：候选环状切位图 × 完全消化片段长度多重集（环长 12）")
+    print("=" * 70)
+    # 完全消化后测得四段，长度多重集 {2,2,4,4}（测量顺序无意义）。
+    observed = [4, 2, 4, 2]
+    # 候选池（切位边界显式给出；图A' 是图A 整体旋转 +1，图B 排列不同）：
+    candidates = [
+        CutMap(12, (0, 2, 4, 8), label="图A (0,2,4,8) 间隙2,2,4,4"),
+        CutMap(12, (1, 3, 5, 9), label="图A旋转+1 (1,3,5,9)"),
+        CutMap(12, (0, 2, 6, 8), label="图B (0,2,6,8) 间隙2,4,2,4"),
+        CutMap(12, (0, 3, 6, 9), label="图C (0,3,6,9) 间隙3,3,3,3"),
+        CutMap(12, (), label="未切环 () 间隙12"),
+    ]
+    print(f"测得片段长度: {observed}（多重集，顺序无关）")
+    for c in candidates:
+        print(f"  候选 {c.label}: 完全消化长度 {c.fragment_lengths()}")
+    result = match_candidates(observed, candidates)
+    print(f"检查候选 {result.examined} 个，旋转等价去重后 {result.unique_classes} 类")
+    print(f"匹配 {len(result.matches)} 个：")
+    for m in result.matches:
+        print(f"  ✓ {m.label}")
+    print("  （图A 与其旋转图只保留先出现者；图B 多重集相同但排列不同，")
+    print("    不与图A 旋转等价，故作为第二个独立答案保留；图C/未切环不匹配）")
+
+    # 与旧切割规则打通：真实酶切一个环，提出切位图，再用测得长度匹配。
+    seq = "AAACCCGGGTTT"  # 12 bp 环，SmaI 唯一位点起点 3 -> 平端切口 6
+    dr = digest(seq, smai, topology="circular")
+    derived = map_from_digest(dr)
+    print()
+    print(f"旧规则联动：digest({seq!r}, SmaI, 环状) -> 切位图 "
+          f"length={derived.length}, cuts={derived.cuts}")
+    one_cut_pool = [CutMap(12, (), label="未切环"),
+                    CutMap(12, (6,), label="单切@6"),
+                    CutMap(12, (0,), label="单切@0（与@6旋转等价）")]
+    r1 = match_candidates([derived.length], one_cut_pool)
+    print(f"  对测得长度 [{derived.length}] 匹配：{[m.label for m in r1.matches]}")
+    print("  -> 未切环与单切环都只产生一个全长片段，且互不等价，均列出；")
+    print("     两个不同位置的单切口互为旋转，只保留一个。")
+
+    # 边界：无匹配是穷举后被证明的结果。
+    r_none = match_candidates([5, 7], candidates)
+    print(f"  对找不到的长度 [5,7]：matched={r_none.matched}，matches={r_none.matches}")
+
+    # 实际错误：非法候选（重复切口 / 越界）必须明确拒绝，不静默纠正。
+    print()
+    print("-- 新功能的实际错误：非法切位图候选 --")
+    try:
+        CutMap(12, (3, 3))
+    except CandidateError as exc:
+        print(f"CutMap(12, (3, 3)) -> CandidateError：{exc}")
+    try:
+        match_candidates([2, 0, 10], [CutMap(12, (0, 2))])
+    except CandidateError as exc:
+        print(f"observed 含 0 长片段 -> CandidateError：{exc}")
+    else:
+        raise AssertionError("应当触发 CandidateError 但未触发")
 
     print()
     print("=" * 70)
