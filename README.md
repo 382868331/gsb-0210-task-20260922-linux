@@ -6,6 +6,10 @@
 当交错切口造成无法做无交叉简单归属的片段时，明确抛出 `DigestUnsupportedError`，
 绝不猜测配对。
 
+在此之上提供**候选环状切位图筛查**：给定一组候选环状序列、显式酶定义和
+完全消化的片段长度多重集，调用同一切割规则逐一评估，按旋转等价类去重后
+列出长度图样精确匹配的候选（`match_candidates`）。
+
 ## 运行环境
 
 - Python **3.14.7**（仅使用标准库 `dataclasses`、`math`、`typing`）。
@@ -15,17 +19,23 @@
 ## 运行命令（在仓库根目录执行）
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（48 个用例）
-python demo.py                            # 固定输入演示（约 0.04 秒）
+python -m unittest discover -s tests -v   # 必要测试（77 个用例）
+python demo.py                            # 固定输入演示（约 0.1 秒）
 ```
 
 ## 公开接口
 
 ```python
-from restriction_digest import Enzyme, digest, compatible
+from restriction_digest import Enzyme, digest, compatible, match_candidates
 
 ecori = Enzyme(name="EcoRI", recognition="GAATTC", top_cut=1, bottom_cut=5)
 result = digest("GGGAATTCCC", ecori, topology="linear")   # 或 "circular"
+
+# 候选环状切位图筛查（旋转等价去重，片段长度精确多重集匹配）
+screen = match_candidates(
+    ["GAATTCGAATTC", "TTCGAATTCGAA"], ecori, [6, 6],
+)
+screen.matches[0].indices          # (0, 1)：两条是同一环的不同旋转写法
 ```
 
 ### `Enzyme`
@@ -83,6 +93,41 @@ result = digest("GGGAATTCCC", ecori, topology="linear")   # 或 "circular"
 两个末端能否互补拼接：平端配平端；黏端要求同类且一条突出的 5′→3′ 序列
 是另一条的反向互补（如 EcoRI 的 `AATT` 自补）。`None` 末端不可拼接。
 
+### `match_candidates(candidates, enzymes, fragment_lengths) -> ScreenResult`
+
+候选环状切位图筛查：对每个候选环状序列调用 `digest(..., topology="circular")`
+做完全消化，取各片段的**上链切口跨度**作为片段长度（酶切图谱通行约定，
+总和恒等于环长），与观测的 `fragment_lengths` 做**多重集精确匹配**
+（重复片段按计数匹配，如 `(6,6)` 不等于 `(6,)`）。
+
+- `candidates`：候选环状序列的可迭代对象（大写 `ACGT`，校验规则同
+  `digest` 的底物，错误信息带 `candidates[i]` 下标）；空列表合法，
+  结果为零匹配。
+- `enzymes`：单个 `Enzyme` 或非空可迭代对象（同 `digest`）。
+- `fragment_lengths`：观测片段长度多重集，非空正整数可迭代对象；
+  拒绝 `bool`、任何 `float`（`NaN`/`±Infinity` 有专门报错）与非正整数，
+  抛 `FragmentLengthsError`。顺序无关，内部升序归一。
+- **旋转等价去重**：同一物理环状分子的不同旋转写法是同一个候选，
+  按最小字典序旋转（Booth 算法，O(n)）归一去重，每个等价类只评估一次、
+  只报告一次，`representative` 取输入中该类首次出现的写法，`indices`
+  记录该类全部输入下标。
+- 纯函数：候选与片段长度在任何评估之前完成整体校验，非法输入立即抛出，
+  不存在部分结果。
+
+`ScreenResult`：
+
+- `target_lengths`：升序归一后的观测多重集；
+- `candidate_count` / `class_count`：输入候选总数 / 旋转去重后的类数；
+- `matches: tuple[CandidateMatch, ...]`：精确匹配的候选类，按输入首次
+  出现顺序。`CandidateMatch` 含 `representative`、`indices`、`length`、
+  `fragment_lengths`（升序）、`cut_count`（物理断裂数，0 = 未切环）；
+- `unsupported: tuple[UnsupportedCandidate, ...]`：`digest` 判定为非简单
+  几何（`DigestUnsupportedError`）的候选类，附 `reason`；它们不参与匹配，
+  也不中断其余候选的评估。
+
+注意：未切环与单切环的长度多重集都是 `(N,)`，凝胶长度图样无法区分，
+用 `CandidateMatch.cut_count` 辨别。
+
 ## 坐标与归属约定（设计取舍）
 
 1. **上链统一坐标系**：所有切口都是上链 5′→3′ 的边界编号；下链切口也用
@@ -103,8 +148,11 @@ result = digest("GGGAATTCCC", ecori, topology="linear")   # 或 "circular"
 
 - `DigestError(ValueError)`：本模块错误基类。
   - `EnzymeDefinitionError`：酶定义非法（识别串字符/长度、偏移类型等）。
-  - `SequenceError`：底物非法，错误信息含**从 0 开始的位置下标**。
+  - `SequenceError`：底物非法，错误信息含**从 0 开始的位置下标**；
+    候选筛查时带 `candidates[i]` 下标。
   - `DigestUnsupportedError`：输入合法，但几何上不属于支持的简单片段。
+  - `FragmentLengthsError`：观测片段长度多重集非法（空、非正整数、
+    bool、float/NaN/Infinity 等）。
 - 整数参数（`top_cut`/`bottom_cut`）拒绝 `bool`；任何 `float` 都拒绝，
   其中 `NaN`/`±Infinity` 有专门报错信息。
 - “没有识别位点”是穷举搜索后**被证明的无解**（返回未切分子），与任何
@@ -120,12 +168,22 @@ result = digest("GGGAATTCCC", ecori, topology="linear")   # 或 "circular"
 - 交错切口互相侵入（配对区 ≤ 0）、同一物理切口配对冲突、
   `|错位| ≥ 环长`、线性边缘单链切割等情形一律 unsupported。
 - 单条序列上限 5000 bp、识别串上限 12 bp，均为接口硬边界。
+- 候选筛查只做**精确长度多重集匹配**：不做测量区间/容差反演、
+  不做部分消化或混合样本建模；片段长度取上链切口跨度（黏端片段的
+  上/下链跨度可能不同，本接口固定取上链口径）。
+- 长度多重集无法区分未切环与单切环（都是 `(N,)`），也无法区分
+  产生相同切口间距图样的不同序列；这些都如实作为不同/相同候选类报告，
+  不做额外猜测。
 
 ## 测试与独立参考说明
 
 - 测试用例的期望值全部手算，或由测试文件内独立的小函数（`ref_revcomp`、
-  显式列窗等）给出，**不调用被测核心生成期望值**；链长守恒、沃森-克里克
-  配对等往返/不变量检查只作为补充（`TestRoundTripInvariants`）。
+  `ref_circular_lengths`、显式列窗等）给出，**不调用被测核心生成期望值**；
+  链长守恒、沃森-克里克配对等往返/不变量检查只作为补充
+  （`TestRoundTripInvariants`）。
 - 覆盖：平端、5′/3′ 黏端、单切环状（平端/黏端再环化）、跨零识别、
   反向酶坐标转换、回文单次计数、重复位点、重复物理切口去重、不切、
   IUPAC（含 N）、各类 unsupported 与全部输入校验。
+- 候选筛查覆盖：精确匹配、重复片段多重性、旋转等价去重（含全部 12 个
+  旋转写法）、未切环/单切环同图样、无匹配、多酶图样、几何不可归属候选
+  收入 unsupported 不中断、以及片段长度与候选的全部输入校验。

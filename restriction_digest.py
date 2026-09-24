@@ -8,6 +8,9 @@
 * 片段按上链切口排序（环状循环排序，线性追加分子两端 0/N 的平端边界）。
 * 当交错切口导致片段无法做无交叉的简单归属时，抛出
   :class:`DigestUnsupportedError`，绝不猜测配对。
+* :func:`match_candidates` 在旧切割规则之上做候选环状切位图筛查：
+  输入一组候选环状序列与完全消化的片段长度多重集，精确匹配并
+  按旋转等价类去重后列出命中候选。
 
 全部计算均为整数运算，没有浮点输出，因此不存在误差口径/容差问题。
 """
@@ -26,13 +29,18 @@ __all__ = [
     "EnzymeDefinitionError",
     "SequenceError",
     "DigestUnsupportedError",
+    "FragmentLengthsError",
     "Enzyme",
     "EndInfo",
     "Fragment",
     "CutSite",
     "DigestResult",
+    "CandidateMatch",
+    "UnsupportedCandidate",
+    "ScreenResult",
     "compatible",
     "digest",
+    "match_candidates",
 ]
 
 MAX_BASES: Final[int] = 5000
@@ -88,6 +96,10 @@ class SequenceError(DigestError):
 
 class DigestUnsupportedError(DigestError):
     """输入合法，但交错切口产生非简单片段，本契约明确拒绝猜测配对。"""
+
+
+class FragmentLengthsError(DigestError):
+    """观测的完全消化片段长度多重集非法（空、非正整数、bool/浮点等）。"""
 
 
 # ---------------------------------------------------------------------------
@@ -578,3 +590,232 @@ def digest(
         ))
 
     return DigestResult(topology, n, cut_sites, tuple(fragments))
+
+
+# ---------------------------------------------------------------------------
+# 候选环状切位图筛查（调用上面的旧切割规则）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CandidateMatch:
+    """一个与观测片段长度多重集精确匹配的候选旋转等价类。
+
+    * representative：输入中该类首次出现的候选序列（同一物理环状分子的
+      不同旋转写法只报告一次）。
+    * indices：该等价类在输入候选中的全部下标（按输入顺序）。
+    * fragment_lengths：完全消化后的片段长度多重集（升序）。片段长度取
+      相邻上链切口之间的碱基跨度（酶切图谱的通行约定，总和恒等于环长）。
+    * cut_count：去重后的物理断裂数；0 表示未切环。注意未切环与单切环
+      的长度多重集都是 ``(N,)``，只能靠 cut_count 区分。
+    """
+
+    representative: str
+    indices: tuple[int, ...]
+    length: int
+    fragment_lengths: tuple[int, ...]
+    cut_count: int
+
+
+@dataclass(frozen=True)
+class UnsupportedCandidate:
+    """几何上无法做简单片段归属的候选类（不视为匹配，也不中断筛查）。"""
+
+    representative: str
+    indices: tuple[int, ...]
+    reason: str
+
+
+@dataclass(frozen=True)
+class ScreenResult:
+    """候选筛查结果。
+
+    * target_lengths：校验并升序排序后的观测片段长度多重集。
+    * candidate_count：输入候选总数（含旋转重复）。
+    * class_count：旋转等价去重后实际评估的候选类数。
+    * matches：长度多重集与观测精确相等（含重复计数）的候选类，
+      按输入中首次出现的顺序排列。
+    * unsupported：digest 判定为非简单几何（DigestUnsupportedError）的
+      候选类，附原因；它们不参与匹配。
+    """
+
+    target_lengths: tuple[int, ...]
+    candidate_count: int
+    class_count: int
+    matches: tuple[CandidateMatch, ...]
+    unsupported: tuple[UnsupportedCandidate, ...]
+
+
+def _validate_fragment_lengths(value: object) -> tuple[int, ...]:
+    """校验观测片段长度多重集：非空、元素为正整数；拒绝 bool 与任何 float。"""
+    if isinstance(value, bool) or isinstance(value, (str, bytes)):
+        raise FragmentLengthsError(
+            f"fragment_lengths 必须是正整数的可迭代对象，收到 {type(value).__name__}"
+        )
+    try:
+        items = tuple(value)  # type: ignore[call-overload]
+    except TypeError:
+        raise FragmentLengthsError(
+            f"fragment_lengths 必须是正整数的可迭代对象，收到 {type(value).__name__}"
+        ) from None
+    if not items:
+        raise FragmentLengthsError(
+            "fragment_lengths 不能为空：完全消化至少产生一个片段"
+            "（未切环为全长单片段）"
+        )
+    out: list[int] = []
+    for i, v in enumerate(items):
+        if isinstance(v, bool):
+            raise FragmentLengthsError(
+                f"fragment_lengths[{i}] 不能是 bool，必须是正整数"
+            )
+        if isinstance(v, float):
+            if math.isnan(v):
+                raise FragmentLengthsError(
+                    f"fragment_lengths[{i}] 不能是 NaN，长度必须是精确正整数"
+                )
+            if math.isinf(v):
+                raise FragmentLengthsError(
+                    f"fragment_lengths[{i}] 不能是 Infinity，长度必须是精确正整数"
+                )
+            raise FragmentLengthsError(
+                f"fragment_lengths[{i}] 必须是 int，收到 float: {v!r}"
+                "（本契约只做精确长度匹配，不接受测量近似值）"
+            )
+        if not isinstance(v, int):
+            raise FragmentLengthsError(
+                f"fragment_lengths[{i}] 必须是 int，收到 {type(v).__name__}"
+            )
+        if v < 1:
+            raise FragmentLengthsError(
+                f"fragment_lengths[{i}] 必须是正整数，收到 {v}"
+            )
+        out.append(v)
+    return tuple(sorted(out))
+
+
+def _validate_candidates(value: object) -> tuple[str, ...]:
+    """校验候选序列集合；错误信息带候选下标，便于定位。"""
+    if isinstance(value, bool) or isinstance(value, (str, bytes)):
+        raise SequenceError(
+            "candidates 必须是候选序列（str）的可迭代对象，不是单个字符串"
+        )
+    try:
+        items = tuple(value)  # type: ignore[call-overload]
+    except TypeError:
+        raise SequenceError(
+            f"candidates 必须是候选序列的可迭代对象，收到 {type(value).__name__}"
+        ) from None
+    out: list[str] = []
+    for i, cand in enumerate(items):
+        try:
+            out.append(_validate_sequence(cand))
+        except SequenceError as exc:
+            raise SequenceError(f"candidates[{i}] 非法：{exc}") from exc
+    return tuple(out)
+
+
+def _canonical_rotation(s: str) -> str:
+    """最小字典序旋转（Booth 算法，O(n)），作为旋转等价类的规范键。"""
+    n = len(s)
+    doubled = s + s
+    i, j, k = 0, 1, 0
+    while i < n and j < n and k < n:
+        a = doubled[i + k]
+        b = doubled[j + k]
+        if a == b:
+            k += 1
+        elif a > b:
+            i = i + k + 1
+            if i <= j:
+                i = j + 1
+            k = 0
+        else:
+            j = j + k + 1
+            if j <= i:
+                j = i + 1
+            k = 0
+    start = min(i, j)
+    return doubled[start:start + n]
+
+
+def match_candidates(
+    candidates: Iterable[str],
+    enzymes: Union[Enzyme, Iterable[Enzyme]],
+    fragment_lengths: Iterable[int],
+) -> ScreenResult:
+    """用旧切割规则筛查候选环状切位图，列出与观测片段长度匹配的候选。
+
+    对每个候选环状序列调用 :func:`digest`（``topology="circular"``）做
+    完全消化，取各片段的上链切口跨度作为片段长度，与观测的
+    ``fragment_lengths`` 做多重集精确比较（重复片段按计数匹配）。
+
+    * 同一物理环状分子的不同旋转写法是同一个候选：按最小字典序旋转
+      归一去重，每个等价类只评估一次、只报告一次（附全部输入下标）。
+    * digest 判定为非简单几何（:class:`DigestUnsupportedError`）的候选类
+      不视为匹配，收入 ``ScreenResult.unsupported``，不中断其余候选。
+    * 纯函数：候选与片段长度在任何评估之前完成校验，非法输入立即抛出
+      （:class:`SequenceError` / :class:`FragmentLengthsError` /
+      :class:`EnzymeDefinitionError`），不存在部分结果。
+    * 长度精确匹配，不做测量区间/容差反演；未切环的长度多重集为 ``(N,)``，
+      与单切环不可区分（用 ``CandidateMatch.cut_count`` 辨别）。
+    """
+    target = _validate_fragment_lengths(fragment_lengths)
+    candidate_list = _validate_candidates(candidates)
+
+    # 酶列表预先归一化（避免可迭代对象在多轮 digest 中被耗尽），
+    # 并保证酶定义错误在任何候选评估之前抛出。
+    if isinstance(enzymes, Enzyme):
+        enzyme_tuple = (enzymes,)
+    else:
+        try:
+            enzyme_tuple = tuple(enzymes)
+        except TypeError as exc:
+            raise EnzymeDefinitionError(
+                "enzymes 必须是 Enzyme 或 Enzyme 可迭代对象"
+            ) from exc
+    if not enzyme_tuple:
+        raise EnzymeDefinitionError("至少需要一个 Enzyme")
+    for i, enz in enumerate(enzyme_tuple):
+        if not isinstance(enz, Enzyme):
+            raise EnzymeDefinitionError(
+                f"enzymes[{i}] 不是 Enzyme 实例（类型 {type(enz).__name__}）"
+            )
+
+    # 旋转等价去重：规范键 -> 该类首次出现的序列与全部输入下标。
+    reps: dict[str, str] = {}
+    members: dict[str, list[int]] = {}
+    for i, seq in enumerate(candidate_list):
+        key = _canonical_rotation(seq)
+        if key in reps:
+            members[key].append(i)
+        else:
+            reps[key] = seq
+            members[key] = [i]
+
+    matches: list[CandidateMatch] = []
+    unsupported: list[UnsupportedCandidate] = []
+    for key, rep in reps.items():
+        indices = tuple(members[key])
+        try:
+            res = digest(rep, enzyme_tuple, topology="circular")
+        except DigestUnsupportedError as exc:
+            unsupported.append(UnsupportedCandidate(rep, indices, str(exc)))
+            continue
+        lengths = tuple(sorted(f.top_length for f in res.fragments))
+        if lengths == target:
+            matches.append(CandidateMatch(
+                representative=rep,
+                indices=indices,
+                length=len(rep),
+                fragment_lengths=lengths,
+                cut_count=res.cut_count,
+            ))
+
+    return ScreenResult(
+        target_lengths=target,
+        candidate_count=len(candidate_list),
+        class_count=len(reps),
+        matches=tuple(matches),
+        unsupported=tuple(unsupported),
+    )

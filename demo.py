@@ -1,4 +1,4 @@
-"""固定输入演示：真实计算限制性酶切片段归属，并打印一个正常结果和一个实际触发的拒绝边界。
+"""固定输入演示：真实计算限制性酶切片段归属与候选环状切位图筛查。
 
 运行：python demo.py
 数据全部在本文件内确定性给出，不读网络/文件/环境变量。
@@ -7,8 +7,10 @@
 from restriction_digest import (
     DigestUnsupportedError,
     Enzyme,
+    FragmentLengthsError,
     compatible,
     digest,
+    match_candidates,
 )
 
 
@@ -73,6 +75,52 @@ def main():
         print("-> 模块拒绝猜测配对，没有返回乱配的片段。")
     else:
         raise AssertionError("应当触发 DigestUnsupportedError 但未触发")
+
+    print()
+    print("=" * 70)
+    print("候选环状切位图筛查：观测片段长度多重集 -> 匹配候选（旋转等价去重）")
+    print("=" * 70)
+    # 5 个候选环状序列；1 号是 0 号的旋转写法（同一物理环状分子）。
+    candidates = [
+        "GAATTCGAATTC",    # 0: 两个 EcoRI 位点 -> 片段 (6, 6)
+        "TTCGAATTCGAA",    # 1: 0 号旋转 3 位的写法
+        "GAATTCCGAATTCC",  # 2: 两个位点 -> (7, 7)
+        "ACGTACGTACGT",    # 3: 无位点，未切环 -> (12,)
+        "GGGAATTCCCAA",    # 4: 单切环 -> (12,)
+    ]
+    print(f"候选 {len(candidates)} 条（含旋转重复写法），酶: EcoRI")
+    res = match_candidates(candidates, ecori, [6, 6])
+    print(f"观测片段长度多重集: [6, 6]；去重后评估 {res.class_count} 个旋转等价类")
+    for m in res.matches:
+        print(f"  命中: {m.representative}（输入下标 {m.indices}），"
+              f"片段 {m.fragment_lengths}，物理断裂 {m.cut_count} 处")
+    assert len(res.matches) == 1 and res.matches[0].indices == (0, 1)
+
+    print()
+    print("同一组候选改查 [12]：未切环与单切环长度图样相同，用 cut_count 区分")
+    res12 = match_candidates(candidates, ecori, [12])
+    for m in res12.matches:
+        kind = "未切环" if m.cut_count == 0 else f"{m.cut_count} 处断裂"
+        print(f"  命中: {m.representative}（下标 {m.indices}），{kind}")
+
+    print()
+    print("几何不可归属的候选：收入 unsupported，不中断其余候选")
+    e2 = Enzyme("EcoRI-shift", "GAATTC", 2, 5)
+    res_u = match_candidates(["GAATTCAAAA", "CCCCCCCCCC"], [ecori, e2], [10])
+    for u in res_u.unsupported:
+        print(f"  unsupported: {u.representative}（下标 {u.indices}）")
+        print(f"    原因: {u.reason}")
+    for m in res_u.matches:
+        print(f"  命中: {m.representative}（下标 {m.indices}），片段 {m.fragment_lengths}")
+
+    print()
+    print("实际错误：观测片段长度含非正整数，整体校验直接拒绝")
+    try:
+        match_candidates(candidates, ecori, [6, 0])
+    except FragmentLengthsError as exc:
+        print(f"如契约预期抛出 FragmentLengthsError：\n  {exc}")
+    else:
+        raise AssertionError("应当触发 FragmentLengthsError 但未触发")
 
 
 if __name__ == "__main__":
