@@ -14,8 +14,10 @@ from restriction_digest import (
     Enzyme,
     EnzymeDefinitionError,
     SequenceError,
+    UnknownSiteError,
     compatible,
     digest,
+    recognize_sites,
 )
 
 
@@ -433,6 +435,115 @@ class TestValidation(unittest.TestCase):
             digest(b"GAATTC", ECORI)  # type: ignore[arg-type]
         with self.assertRaises(SequenceError):
             digest(123, ECORI)  # type: ignore[arg-type]
+
+
+class TestSelectiveDigest(unittest.TestCase):
+    """确定性部分酶切：识别全部位点，只登记显式启用的物理识别位点。"""
+
+    SEQ = "GAATTCAAAA"
+    SHARED_TOP = Enzyme("SharedTop-A", "GAATTC", 1, 5)
+    SHARED_TOP_LONG = Enzyme("SharedTop-B", "GAATTC", 1, 6)
+
+    def test_palindromic_sources_remain_but_cut_once(self):
+        sites = recognize_sites("GGGAATTCCC", ECORI)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].sources, ("+", "-"))
+        res = digest("GGGAATTCCC", ECORI, enabled_site_ids={sites[0].site_id})
+        self.assertEqual(len(res.cut_sites), 1)
+        self.assertEqual(res.cut_sites[0].sources, ("+", "-"))
+        self.assertEqual(res.cut_count, 1)
+
+    def test_shared_top_boundary_select_only_one_enzyme(self):
+        sites = recognize_sites(self.SEQ, [self.SHARED_TOP, self.SHARED_TOP_LONG])
+        self.assertEqual([site.enzyme for site in sites],
+                         ["SharedTop-A", "SharedTop-B"])
+
+        short = digest(self.SEQ, [self.SHARED_TOP, self.SHARED_TOP_LONG],
+                       enabled_site_ids={sites[0].site_id})
+        self.assertEqual([(s.top_boundary, s.bottom_boundary) for s in short.cut_sites],
+                         [(1, 5)])
+        self.assertEqual((short.fragments[0].top_strand,
+                          short.fragments[0].bottom_strand),
+                         ("G", ref_revcomp("GAATT")))
+        self.assertEqual((short.fragments[1].top_strand,
+                          short.fragments[1].bottom_strand),
+                         ("AATTCAAAA", ref_revcomp("CAAAA")))
+
+        long = digest(self.SEQ, [self.SHARED_TOP, self.SHARED_TOP_LONG],
+                      enabled_site_ids={sites[1].site_id})
+        self.assertEqual([(s.top_boundary, s.bottom_boundary) for s in long.cut_sites],
+                         [(1, 6)])
+        self.assertEqual((long.fragments[0].top_strand,
+                          long.fragments[0].bottom_strand),
+                         ("G", ref_revcomp("GAATTC")))
+        self.assertEqual((long.fragments[1].top_strand,
+                          long.fragments[1].bottom_strand),
+                         ("AATTCAAAA", ref_revcomp("AAAA")))
+
+        with self.assertRaises(DigestUnsupportedError):
+            digest(self.SEQ, [self.SHARED_TOP, self.SHARED_TOP_LONG])
+
+    def test_empty_enabled_set_is_uncut(self):
+        linear_sites = recognize_sites("GGGAATTCCC", ECORI)
+        linear = digest("GGGAATTCCC", ECORI, enabled_site_ids=frozenset())
+        self.assertEqual(linear.recognition_sites, tuple(linear_sites))
+        self.assertEqual(linear.cut_sites, ())
+        self.assertEqual(len(linear.fragments), 1)
+        self.assertFalse(linear.fragments[0].circular)
+
+        circular = digest("GGGAATTCCCAA", ECORI, topology="circular",
+                          enabled_site_ids=[])
+        self.assertEqual(len(circular.recognition_sites), 1)
+        self.assertEqual(circular.cut_sites, ())
+        self.assertTrue(circular.fragments[0].circular)
+        self.assertIsNone(circular.fragments[0].left_end)
+
+    def test_circular_site_crossing_origin_selected(self):
+        seq = "ATTC" + "G" * 7 + "A"
+        sites = recognize_sites(seq, ECORI, topology="circular")
+        self.assertEqual((sites[0].start, sites[0].matched_sequence), (10, "GAATTC"))
+        res = digest(seq, ECORI, topology="circular",
+                     enabled_site_ids=[sites[0].site_id])
+        cut = res.cut_sites[0]
+        self.assertEqual((cut.top_boundary, cut.bottom_boundary), (11, 3))
+        frag = res.fragments[0]
+        self.assertEqual((frag.top_start, frag.top_length, frag.bottom_start,
+                          frag.bottom_length), (11, 12, 3, 12))
+        self.assertEqual(frag.top_strand, "AATTCGGGGGGG")
+        self.assertEqual(frag.bottom_strand, ref_revcomp("CGGGGGGGAATT"))
+        self.assertEqual(frag.left_end.overhang, "AATT")
+        self.assertEqual(frag.right_end.overhang, "AATT")
+
+    def test_stale_ids_from_other_input_are_rejected(self):
+        old_sites = recognize_sites("GGGAATTCCC", ECORI)
+        with self.assertRaises(UnknownSiteError):
+            digest("AAGAATTCAA", ECORI, enabled_site_ids={old_sites[0].site_id})
+        other_enzyme = Enzyme("Other", "GAATTC", 1, 5)
+        with self.assertRaises(UnknownSiteError):
+            digest("GGGAATTCCC", other_enzyme,
+                   enabled_site_ids={old_sites[0].site_id})
+
+    def test_enable_all_matches_default_complete_digest(self):
+        seq = "GAATTCxGAATTC".replace("x", "CC")
+        enzymes = [ECORI, SMAI, NSII]
+        sites = recognize_sites(seq, enzymes)
+        selected = digest(seq, enzymes,
+                          enabled_site_ids={site.site_id for site in sites})
+        default = digest(seq, enzymes)
+        self.assertEqual(selected.cut_sites, default.cut_sites)
+        self.assertEqual(selected.fragments, default.fragments)
+        self.assertEqual(sum(f.top_length for f in selected.fragments), len(seq))
+        self.assertEqual(sum(f.bottom_length for f in selected.fragments), len(seq))
+        overhang_bases = sum(
+            end.overhang_length
+            for frag in selected.fragments
+            for end in (frag.left_end, frag.right_end)
+        )
+        paired_bases = 2 * sum(frag.paired_length for frag in selected.fragments)
+        self.assertEqual(
+            sum(frag.top_length + frag.bottom_length for frag in selected.fragments),
+            paired_bases + overhang_bases,
+        )
 
 
 class TestRoundTripInvariants(unittest.TestCase):

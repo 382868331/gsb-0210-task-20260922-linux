@@ -7,8 +7,10 @@
 from restriction_digest import (
     DigestUnsupportedError,
     Enzyme,
+    UnknownSiteError,
     compatible,
     digest,
+    recognize_sites,
 )
 
 
@@ -54,6 +56,36 @@ def main():
         print(f"  片段{f.index}: 上链 {f.top_strand} / 下链 {f.bottom_strand}；"
               f"左 {f.left_end.kind}，右 {f.right_end.kind}")
     print(f"  相邻端可拼接: {compatible(r2.fragments[0].right_end, r2.fragments[1].left_end)}")
+
+    print()
+    print("=" * 70)
+    print("部分酶切：两个酶识别同一物理位点、上链切口相同而下链切口不同")
+    print("=" * 70)
+    partial_seq = "GAATTCAAAA"
+    cut_a = Enzyme("SharedTop-A", "GAATTC", 1, 5)
+    cut_b = Enzyme("SharedTop-B", "GAATTC", 1, 6)
+    partial_sites = recognize_sites(partial_seq, [cut_a, cut_b])
+    print(f"底物（线性）: {partial_seq}；识别到 {len(partial_sites)} 个可独立选择的位点")
+    for site in partial_sites:
+        print(f"  ID={site.site_id}；酶={site.enzyme}；来源={site.sources}")
+    selected = digest(
+        partial_seq,
+        [cut_a, cut_b],
+        enabled_site_ids={partial_sites[0].site_id},
+    )
+    cut = selected.cut_sites[0]
+    print(f"只启用 {cut.enzyme}: 上链切口 {cut.top_boundary}，下链切口 {cut.bottom_boundary}")
+    for frag in selected.fragments:
+        print(f"  片段{frag.index}: 上链 {frag.top_strand} / 下链 {frag.bottom_strand}")
+    empty = digest(partial_seq, cut_a, enabled_site_ids=frozenset())
+    print(f"空集合: 识别位点 {len(empty.recognition_sites)} 个，实际切口 {len(empty.cut_sites)} 个，"
+          f"片段为完整分子 {empty.fragments[0].top_strand!r}")
+    try:
+        digest(partial_seq, cut_b, enabled_site_ids={partial_sites[0].site_id})
+    except UnknownSiteError as exc:
+        print(f"复用旧酶表 ID 时如契约预期拒绝：{exc}")
+    else:
+        raise AssertionError("旧酶表 ID 应当被拒绝但未触发")
 
     print()
     print("=" * 70)

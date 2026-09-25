@@ -8,24 +8,37 @@
 
 ## 运行环境
 
-- Python **3.14.7**（仅使用标准库 `dataclasses`、`math`、`typing`）。
+- Python **3.14.7**（仅使用标准库 `dataclasses`、`hashlib`、`math`、`typing`）。
 - Linux 原生运行；装好 Python 后**无需安装任何第三方依赖**，无需网络、
   账号、密钥、数据库、中间件或 Docker。
 
 ## 运行命令（在仓库根目录执行）
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（48 个用例）
-python demo.py                            # 固定输入演示（约 0.04 秒）
+./.venv/bin/python -m unittest discover -s tests -v   # 54 个用例
+./.venv/bin/python demo.py                            # 固定输入演示（远低于 90 秒）
 ```
 
 ## 公开接口
 
 ```python
-from restriction_digest import Enzyme, digest, compatible
+from restriction_digest import Enzyme, digest, recognize_sites, compatible
 
 ecori = Enzyme(name="EcoRI", recognition="GAATTC", top_cut=1, bottom_cut=5)
 result = digest("GGGAATTCCC", ecori, topology="linear")   # 或 "circular"
+```
+
+确定性部分酶切分两步：先识别并取得本次输入绑定的稳定位点 ID，再传入 ID 集合。
+
+```python
+sites = recognize_sites("GGGAATTCCC", ecori)
+partial = digest(
+    "GGGAATTCCC",
+    ecori,
+    topology="linear",
+    enabled_site_ids={sites[0].site_id},
+)
+uncut = digest("GGGAATTCCC", ecori, enabled_site_ids=frozenset())
 ```
 
 ### `Enzyme`
@@ -47,21 +60,40 @@ result = digest("GGGAATTCCC", ecori, topology="linear")   # 或 "circular"
 示例：EcoRI `G^AATTC` / `CTTAA^G` → `(1, 5)`；SmaI `CCC^GGG` → `(3, 3)`；
 3′ 突出的 `ATGCA^T` / `T^ACGTA` → `(5, 1)`。
 
-### `digest(sequence, enzymes, topology="linear") -> DigestResult`
+### `recognize_sites(sequence, enzymes, topology="linear") -> tuple[RecognitionSite, ...]`
+
+只穷举识别，不执行切口登记，也不判断交错切口是否可构造片段。
+`RecognitionSite` 字段：`site_id`、`enzyme_index`（从 0 开始，按传入酶表）、
+`enzyme`、`start`、`length`、`matched_sequence`（环状可按起点跨 0 读取）、
+`sources`（包含 `"+"`、`"-"` 或两者）。回文或简并回文识别串在正反向
+同时命中时仍是一个物理识别位点；方向来源保留在 `sources` 中。
+
+`site_id` 是不透明字符串，内部绑定本次序列、拓扑、有序酶表、酶序号和起点。
+相同 Python 输入重复调用得到相同 ID；把旧 DNA、旧拓扑或旧酶表产生的 ID 混入
+新调用会抛出 `UnknownSiteError`，不会猜测为最近似位点。环状 ID 锚定调用者给出的
+序列坐标原点：输入旋转后 `start` 与 ID 随之改变，应重新调用 `recognize_sites`；
+跨 0 识别位点仍以其在当前旋转中的最小循环起点 `0..N-1` 表示。
+
+### `digest(sequence, enzymes, topology="linear", enabled_site_ids=None) -> DigestResult`
 
 - `sequence`：大写 `ACGT` 字符串，长度 1..**5000**。底物不接受简并碱基、
   小写或空白（不做静默纠正）。
 - `enzymes`：单个 `Enzyme` 或非空可迭代对象（多酶同时完全酶切）。
 - `topology`：`"linear"` 或 `"circular"`。
+- `enabled_site_ids`：`None`（默认）启用本次识别到的全部位点；传入空集合表示
+  确定性地不切；传入非空可迭代对象时，只对这些物理识别位点执行切口计算和片段构建。
+- 部分酶切是几何选择，不引入概率、反应时长或动力学；重复 ID 与一个 ID 等价。
 - 纯函数、无内部状态；多酶批次在任何片段构造前完成全部校验与登记，
   失败即整体抛出异常，不存在部分变更。
 
 `DigestResult`：
 
 - `topology`, `length`；
-- `cut_sites: tuple[CutSite, ...]`：每条识别命中的证据（酶名、起点、
-  `+`/`-` 链、取模后的上/下链切口）；`cut_count` 为按
-  `(上链边界, 下链边界)` 去重后的物理断裂数；
+- `cut_sites: tuple[CutSite, ...]`：每条已启用断裂的证据（酶名、起点、主
+  `+`/`-` 链、取模后的上/下链切口、`site_id` 与全部 `sources`）；`cut_count`
+  为按 `(上链边界, 下链边界)` 去重后的物理断裂数；
+- `recognition_sites`：本次输入的全部识别结果。即使 `enabled_site_ids` 为空，
+  仍可看到被识别但未启用的位点，而 `cut_sites/fragments` 表示未切分子；
 - `fragments: tuple[Fragment, ...]`：按上链切口排序的片段（环状按循环序，
   可跨越坐标 0；线性顺序的两端为分子天然末端）。
 
@@ -89,6 +121,8 @@ result = digest("GGGAATTCCC", ecori, topology="linear")   # 或 "circular"
    上链坐标表达，避免双坐标制换算错误。环状坐标对 `N` 取模。
 2. **物理切口去重**：`(链, 坐标)` 相同的切口只算一次；若同一物理切口被
    两个不同的对侧切口争夺（无法去重为同一末端），报 `DigestUnsupportedError`。
+   同一物理识别位点的正/反向来源只作来源证据保留；回文位点不会因两条方向来源
+   被切两次。选择阶段以物理识别位点 ID 为单位，而不是以方向来源为单位。
 3. **片段 = 相邻上链切口之间的区间**，下链边界由该物理断裂的固有错位
    `δ = b−a` 决定；简单性判据是：下链跨度为正、配对区长度 `> 0`
    （两端突出互不侵入、双链不解离）且环状交错量 `< N`。任何一条不满足
@@ -105,6 +139,8 @@ result = digest("GGGAATTCCC", ecori, topology="linear")   # 或 "circular"
   - `EnzymeDefinitionError`：酶定义非法（识别串字符/长度、偏移类型等）。
   - `SequenceError`：底物非法，错误信息含**从 0 开始的位置下标**。
   - `DigestUnsupportedError`：输入合法，但几何上不属于支持的简单片段。
+  - `UnknownSiteError`：启用 ID 中有任何一项不属于本次 DNA、拓扑与有序酶表的
+    识别结果；混入旧结果时整体拒绝，不部分执行。
 - 整数参数（`top_cut`/`bottom_cut`）拒绝 `bool`；任何 `float` 都拒绝，
   其中 `NaN`/`±Infinity` 有专门报错信息。
 - “没有识别位点”是穷举搜索后**被证明的无解**（返回未切分子），与任何
@@ -116,7 +152,7 @@ result = digest("GGGAATTCCC", ecori, topology="linear")   # 或 "circular"
 - 底物只接受具体碱基 `ACGT`；IUPAC 简并仅用于酶识别串；不支持 U、
   小写自动转换、RNA、修饰碱基或缺口/泡状底物。
 - 不模拟酶切反应动力学、星号活性、甲基化阻断、温度/缓冲液条件，
-  也不输出片段浓度；只做确定性的完全酶切几何归属。
+  也不输出片段浓度；默认完全酶切与显式位点子集都只是确定性的几何归属。
 - 交错切口互相侵入（配对区 ≤ 0）、同一物理切口配对冲突、
   `|错位| ≥ 环长`、线性边缘单链切割等情形一律 unsupported。
 - 单条序列上限 5000 bp、识别串上限 12 bp，均为接口硬边界。
@@ -128,4 +164,4 @@ result = digest("GGGAATTCCC", ecori, topology="linear")   # 或 "circular"
   配对等往返/不变量检查只作为补充（`TestRoundTripInvariants`）。
 - 覆盖：平端、5′/3′ 黏端、单切环状（平端/黏端再环化）、跨零识别、
   反向酶坐标转换、回文单次计数、重复位点、重复物理切口去重、不切、
-  IUPAC（含 N）、各类 unsupported 与全部输入校验。
+  IUPAC（含 N）、选择位点、空集合、旧 ID 整体拒绝、各类 unsupported 与全部输入校验。
