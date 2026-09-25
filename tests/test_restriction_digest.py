@@ -10,12 +10,14 @@ import unittest
 
 from restriction_digest import (
     MAX_BASES,
+    DigestError,
     DigestUnsupportedError,
     Enzyme,
     EnzymeDefinitionError,
     SequenceError,
     compatible,
     digest,
+    recognize_sites,
 )
 
 
@@ -478,6 +480,141 @@ class TestRoundTripInvariants(unittest.TestCase):
         # 线性分子两端始终是平端
         self.assertEqual(res.fragments[0].left_end.kind, "blunt")
         self.assertEqual(res.fragments[-1].right_end.kind, "blunt")
+
+
+class TestSelectiveDigest(unittest.TestCase):
+    """确定性部分酶切：识别全部位点，只启用 ID 集合中的物理位点。"""
+
+    SEQ = "AAAAGAATTCTTTT"  # 14 bp，唯一位点 start=4
+
+    def test_recognition_site_keeps_palindromic_direction_sources(self):
+        recognized = recognize_sites(self.SEQ, ECORI)
+        self.assertEqual(len(recognized.sites), 1)
+        site = recognized.sites[0]
+        self.assertEqual(
+            (site.enzyme, site.start, site.matched_sequence, site.strand_sources),
+            ("EcoRI", 4, "GAATTC", ("+", "-"))
+        )
+
+    def test_empty_enabled_set_does_not_cut_linear(self):
+        recognized = recognize_sites(self.SEQ, ECORI)
+        res = digest(self.SEQ, ECORI, enabled_site_ids=set())
+        self.assertEqual(res.cut_sites, ())
+        self.assertEqual(len(res.fragments), 1)
+        self.assertEqual(res.fragments[0].top_strand, self.SEQ)
+        self.assertEqual(res.recognition_sites, recognized.sites)
+
+    def test_empty_enabled_set_preserves_circular_molecule(self):
+        res = digest(self.SEQ, ECORI, topology="circular", enabled_site_ids=())
+        self.assertEqual(res.cut_sites, ())
+        fragment = res.fragments[0]
+        self.assertTrue(fragment.circular)
+        self.assertIsNone(fragment.left_end)
+        self.assertIsNone(fragment.right_end)
+        self.assertEqual(fragment.top_length, len(self.SEQ))
+
+    def test_only_one_of_two_conflicting_bottom_cuts_is_enabled(self):
+        # 两酶识别同一 GAATTC：上链都切在 3，下链分别切在 5 和 7。
+        e1 = Enzyme("A-two", "GAATTC", 1, 3)
+        e2 = Enzyme("B-four", "GAATTC", 1, 5)
+        recognized = recognize_sites(self.SEQ, [e1, e2])
+        site1, site2 = recognized.sites
+
+        res_two = digest(self.SEQ, [e1, e2], enabled_site_ids=[site1.site_id])
+        left, right = res_two.fragments
+        self.assertEqual((res_two.cut_sites[0].top_boundary,
+                          res_two.cut_sites[0].bottom_boundary), (5, 7))
+        self.assertEqual((left.top_strand, left.bottom_strand),
+                         ("AAAAG", ref_revcomp("AAAAGAA")))
+        self.assertEqual(left.right_end.overhang, "TT")
+        self.assertEqual((right.top_strand, right.bottom_strand),
+                         ("AATTCTTTT", ref_revcomp("TTCTTTT")))
+        self.assertEqual(right.left_end.overhang, "AA")
+        self.assertEqual(sum(f.top_length for f in res_two.fragments), len(self.SEQ))
+        self.assertEqual(sum(f.bottom_length for f in res_two.fragments), len(self.SEQ))
+        self.assertEqual(
+            sum(f.paired_length * 2 + f.left_end.overhang_length +
+                f.right_end.overhang_length for f in res_two.fragments),
+            2 * len(self.SEQ)
+        )
+
+        res_four = digest(self.SEQ, [e1, e2], enabled_site_ids={site2.site_id})
+        left, right = res_four.fragments
+        self.assertEqual((res_four.cut_sites[0].top_boundary,
+                          res_four.cut_sites[0].bottom_boundary), (5, 9))
+        self.assertEqual((left.top_strand, left.bottom_strand),
+                         ("AAAAG", ref_revcomp("AAAAGAATT")))
+        self.assertEqual(left.right_end.overhang, "AATT")
+        self.assertEqual((right.top_strand, right.bottom_strand),
+                         ("AATTCTTTT", ref_revcomp("CTTTT")))
+
+        with self.assertRaises(DigestUnsupportedError):
+            digest(self.SEQ, [e1, e2])
+
+    def test_identical_dual_direction_site_cuts_once(self):
+        res = digest(self.SEQ, ECORI, enabled_site_ids=[
+            recognize_sites(self.SEQ, ECORI).sites[0].site_id
+        ])
+        self.assertEqual(len(res.cut_sites), 1)
+        self.assertEqual(len(res.fragments), 2)
+
+    def test_degenerate_site_with_different_directional_cuts_is_still_rejected(self):
+        enzyme = Enzyme("AmbiguousTwo", "RN", 0, 1)
+        recognized = recognize_sites("AT", enzyme)
+        site0 = recognized.sites[0]
+        self.assertEqual(site0.strand_sources, ("+", "-"))
+        with self.assertRaises(DigestUnsupportedError):
+            digest("AT", enzyme, enabled_site_ids=[site0.site_id])
+
+    def test_foreign_or_stale_id_rejected_entirely(self):
+        current = recognize_sites(self.SEQ, ECORI)
+        stale = recognize_sites("TAGAATTCCT", ECORI).sites[0].site_id
+        with self.assertRaises(DigestError):
+            digest(self.SEQ, ECORI, enabled_site_ids=[stale])
+        changed_enzyme = recognize_sites(self.SEQ, SMAI)
+        self.assertNotIn(current.sites[0].site_id,
+                         {site.site_id for site in changed_enzyme.sites})
+
+    def test_circular_identity_is_rotation_invariant_and_cross_zero_cuts(self):
+        seq = TestCrossZeroRecognition.SEQ
+        recognized = recognize_sites(seq, ECORI, topology="circular")
+        site = recognized.sites[0]
+        rotated = seq[2:] + seq[:2]
+        rotated_recognized = recognize_sites(rotated, ECORI, topology="circular")
+        rotated_site = rotated_recognized.sites[0]
+        self.assertEqual(site.site_id, rotated_site.site_id)
+        self.assertEqual((site.start, rotated_site.start), (10, 8))
+
+        res = digest(seq, ECORI, topology="circular",
+                     enabled_site_ids=[site.site_id])
+        self.assertEqual((res.cut_sites[0].top_boundary,
+                          res.cut_sites[0].bottom_boundary), (11, 3))
+        fragment = res.fragments[0]
+        self.assertEqual((fragment.top_start, fragment.top_length), (11, 12))
+        self.assertEqual(fragment.bottom_length, 12)
+        self.assertEqual(fragment.top_strand, "AATTCGGGGGGG")
+        self.assertEqual(fragment.bottom_strand, ref_revcomp("CGGGGGGGAATT"))
+        self.assertEqual(fragment.paired_length, 8)
+        self.assertEqual(
+            fragment.left_end.overhang_length + fragment.right_end.overhang_length,
+            fragment.top_length + fragment.bottom_length - 2 * fragment.paired_length
+        )
+
+    def test_default_is_identical_to_all_enabled(self):
+        enzymes = [ECORI, SMAI]
+        recognized = recognize_sites("AAACCCGGGTTCGAATTCAA", enzymes)
+        default = digest("AAACCCGGGTTCGAATTCAA", enzymes)
+        all_enabled = digest(
+            "AAACCCGGGTTCGAATTCAA",
+            enzymes,
+            enabled_site_ids=[site.site_id for site in recognized.sites],
+        )
+        self.assertEqual(default.cut_sites, all_enabled.cut_sites)
+        self.assertEqual(default.fragments, all_enabled.fragments)
+        self.assertEqual(
+            sum(f.top_length for f in default.fragments),
+            sum(f.bottom_length for f in default.fragments)
+        )
 
 
 if __name__ == "__main__":

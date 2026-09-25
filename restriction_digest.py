@@ -4,7 +4,9 @@
 
 * 底物只接受具体碱基 ``ACGT``（大写）；IUPAC 简并只允许出现在酶识别串中。
 * 切偏移以上链坐标表示，相对识别串起点；同时搜索正向与反向互补位点。
-* 环状 DNA 坐标对长度取模；重复物理切口去重。
+* 识别阶段为每个物理识别区间生成绑定本次输入与酶表的稳定 ID。
+* 环状 DNA 坐标对长度取模；物理位点 ID 对同一环的旋转保持不变。
+* 只有显式启用的识别位点进入切口登记；重复物理切口去重。
 * 片段按上链切口排序（环状循环排序，线性追加分子两端 0/N 的平端边界）。
 * 当交错切口导致片段无法做无交叉的简单归属时，抛出
   :class:`DigestUnsupportedError`，绝不猜测配对。
@@ -14,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass
 from typing import Final, Iterable, Union
@@ -30,8 +33,11 @@ __all__ = [
     "EndInfo",
     "Fragment",
     "CutSite",
+    "RecognitionSite",
+    "RecognitionResult",
     "DigestResult",
     "compatible",
+    "recognize_sites",
     "digest",
 ]
 
@@ -217,13 +223,40 @@ class Fragment:
 
 @dataclass(frozen=True)
 class CutSite:
-    """一次识别命中（搜索证据；物理切口可能在多条命中间去重）。"""
+    """一次已启用识别位点产生的切口证据（完全相同的切口可跨酶去重）。"""
 
     enzyme: str
     start: int
-    strand: str  # "+" 正向，"-" 反向互补
+    strand: str  # "+" 正向，"-" 反向互补；相同切口只保留一条证据
     top_boundary: int
     bottom_boundary: int
+    site_id: str = ""
+
+
+@dataclass(frozen=True)
+class RecognitionSite:
+    """一次物理识别事件，与是否启用酶切无关。
+
+    ``start`` 始终是本次调用序列中的上链起点。环状序列旋转后，``start``
+    会变化，但 ``site_id`` 借助整环字典序最小旋转保持不变。
+    ``strand_sources`` 保留该物理区间的全部识别方向；回文位点同时包含
+    ``+`` 和 ``-``，但后续切口计算只做一次。
+    """
+
+    site_id: str
+    enzyme: str
+    enzyme_index: int
+    start: int
+    length: int
+    matched_sequence: str
+    strand_sources: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RecognitionResult:
+    topology: str
+    length: int
+    sites: tuple[RecognitionSite, ...]
 
 
 @dataclass(frozen=True)
@@ -232,6 +265,7 @@ class DigestResult:
     length: int
     cut_sites: tuple[CutSite, ...]
     fragments: tuple[Fragment, ...]
+    recognition_sites: tuple[RecognitionSite, ...] = ()
 
     @property
     def cut_count(self) -> int:
@@ -268,27 +302,6 @@ def _pattern_sets(pattern: str) -> tuple[frozenset[str], ...]:
 
 def _reverse_complement_iupac(pattern: str) -> str:
     return "".join(_COMPLEMENT[pattern[i]] for i in range(len(pattern) - 1, -1, -1))
-
-
-def _scan(
-    top: str,
-    sets: tuple[frozenset[str], ...],
-    circular: bool,
-) -> list[int]:
-    n = len(top)
-    length = len(sets)
-    last = n if circular else n - length + 1
-    hits: list[int] = []
-    for s in range(last):
-        ok = True
-        for i in range(length):
-            idx = (s + i) % n if circular else s + i
-            if top[idx] not in sets[i]:
-                ok = False
-                break
-        if ok:
-            hits.append(s)
-    return hits
 
 
 def _arc(seq: str, start: int, length: int, circular: bool) -> str:
@@ -357,27 +370,24 @@ def compatible(left: Union[EndInfo, None], right: Union[EndInfo, None]) -> bool:
 _PhysEnd = tuple[int, int, int]
 
 
-def digest(
-    sequence: str,
+def _canonical_rotation_offset(sequence: str) -> int:
+    """返回环状序列字典序最小旋转的起点；旋转后身份不依赖输入原点。"""
+    doubled = sequence + sequence
+    best = 0
+    for candidate in range(1, len(sequence)):
+        if doubled[candidate:candidate + len(sequence)] < doubled[best:best + len(sequence)]:
+            best = candidate
+    return best
+
+
+def _prepare_inputs(
+    sequence: object,
     enzymes: Union[Enzyme, Iterable[Enzyme]],
-    topology: str = "linear",
-) -> DigestResult:
-    """对线性/环状双链 DNA 做一个或多个限制酶的完全酶切片段归属。
-
-    纯函数：不修改任何输入，也没有内部状态，多酶批次要么整体返回结果，
-    要么在任何片段构造前抛异常，不存在部分变更。
-
-    搜索为穷举（O(N·L)，N≤5000，L≤12）：“没有位点”是被证明的结果
-    （返回完整分子的单个片段），不存在搜索预算耗尽这一失败路径。
-    """
+    topology: object,
+) -> tuple[str, tuple[Enzyme, ...], bool]:
     top = _validate_sequence(sequence)
     if isinstance(topology, bool) or not isinstance(topology, str) or topology not in TOPOLOGIES:
-        raise DigestError(
-            f"topology 必须是 {TOPOLOGIES} 之一，收到 {topology!r}"
-        )
-    circular = topology == "circular"
-    n = len(top)
-
+        raise DigestError(f"topology 必须是 {TOPOLOGIES} 之一，收到 {topology!r}")
     if isinstance(enzymes, Enzyme):
         enzyme_list = (enzymes,)
     else:
@@ -387,13 +397,134 @@ def digest(
             raise EnzymeDefinitionError("enzymes 必须是 Enzyme 或 Enzyme 可迭代对象") from exc
     if not enzyme_list:
         raise EnzymeDefinitionError("至少需要一个 Enzyme")
-    for i, enz in enumerate(enzyme_list):
-        if not isinstance(enz, Enzyme):
+    for i, enzyme in enumerate(enzyme_list):
+        if not isinstance(enzyme, Enzyme):
             raise EnzymeDefinitionError(
-                f"enzymes[{i}] 不是 Enzyme 实例（类型 {type(enz).__name__}）"
+                f"enzymes[{i}] 不是 Enzyme 实例（类型 {type(enzyme).__name__}）"
             )
+    return top, enzyme_list, topology == "circular"
 
-    # ---- 1. 搜索正/反向位点并转换切口坐标 ----
+
+def _input_fingerprint(
+    sequence: str,
+    enzymes: tuple[Enzyme, ...],
+    topology: str,
+    canonical_rotation: int = 0,
+) -> str:
+    identity_sequence = (
+        (sequence + sequence)[canonical_rotation:canonical_rotation + len(sequence)]
+        if topology == "circular" else sequence
+    )
+    parts = [topology, str(len(sequence)), identity_sequence]
+    parts.extend(
+        f"{i}:{enzyme.name}:{enzyme.recognition}:{enzyme.top_cut}:{enzyme.bottom_cut}"
+        for i, enzyme in enumerate(enzymes)
+    )
+    return hashlib.sha256("\n".join(parts).encode("ascii")).hexdigest()
+
+
+def _recognize_validated(
+    sequence: str,
+    enzyme_list: tuple[Enzyme, ...],
+    topology: str = "linear",
+) -> RecognitionResult:
+    """穷举识别全部物理位点，但不计算片段、不模拟反应动力学。"""
+    top = sequence
+    circular = topology == "circular"
+    n = len(top)
+    origin_offset = _canonical_rotation_offset(top) if circular else 0
+    fingerprint = _input_fingerprint(top, enzyme_list, topology, origin_offset)
+    sites: list[RecognitionSite] = []
+
+    for enzyme_index, enzyme in enumerate(enzyme_list):
+        forward_sets = _pattern_sets(enzyme.recognition)
+        reverse_pattern = _reverse_complement_iupac(enzyme.recognition)
+        reverse_sets = _pattern_sets(reverse_pattern)
+        for start in range(n if circular else n - len(enzyme.recognition) + 1):
+            forward_ok = all(
+                top[(start + i) % n if circular else start + i] in allowed
+                for i, allowed in enumerate(forward_sets)
+            )
+            reverse_ok = all(
+                top[(start + i) % n if circular else start + i] in allowed
+                for i, allowed in enumerate(reverse_sets)
+            )
+            sources = (["+"] if forward_ok else []) + (["-"] if reverse_ok else [])
+            if not sources:
+                continue
+            canonical_start = (start - origin_offset) % n if circular else start
+            site_id = f"rs-{enzyme_index}-{canonical_start}-{fingerprint}"
+            matched = "".join(
+                top[(start + i) % n if circular else start + i]
+                for i in range(len(enzyme.recognition))
+            )
+            sites.append(RecognitionSite(
+                site_id=site_id,
+                enzyme=enzyme.name,
+                enzyme_index=enzyme_index,
+                start=start,
+                length=len(enzyme.recognition),
+                matched_sequence=matched,
+                strand_sources=tuple(sources),
+            ))
+
+    sites.sort(key=lambda site: (site.start, site.enzyme_index, site.enzyme))
+    return RecognitionResult(topology=topology, length=n, sites=tuple(sites))
+
+
+def recognize_sites(
+    sequence: str,
+    enzymes: Union[Enzyme, Iterable[Enzyme]],
+    topology: str = "linear",
+) -> RecognitionResult:
+    """返回本次输入的全部物理识别位点及其稳定 ID。"""
+    top, enzyme_list, _ = _prepare_inputs(sequence, enzymes, topology)
+    return _recognize_validated(top, enzyme_list, topology)
+
+
+def _normalize_enabled_ids(
+    enabled_site_ids: Union[Iterable[str], None],
+    recognized: RecognitionResult,
+) -> Union[set[str], None]:
+    if enabled_site_ids is None:
+        return None
+    try:
+        enabled = list(enabled_site_ids)
+    except TypeError as exc:
+        raise DigestError("enabled_site_ids 必须是字符串可迭代对象或 None") from exc
+    valid_ids = {site.site_id for site in recognized.sites}
+    for i, site_id in enumerate(enabled):
+        if isinstance(site_id, bool) or not isinstance(site_id, str):
+            raise DigestError(
+                f"enabled_site_ids[{i}] 必须是 str，收到 {type(site_id).__name__}"
+            )
+        if site_id not in valid_ids:
+            raise DigestError(
+                f"enabled_site_ids[{i}]={site_id!r} 不属于本次 DNA、拓扑和酶表的识别结果；"
+                "旧结果或其他输入的 ID 不能混入"
+            )
+    return set(enabled)
+
+
+def digest(
+    sequence: str,
+    enzymes: Union[Enzyme, Iterable[Enzyme]],
+    topology: str = "linear",
+    enabled_site_ids: Union[Iterable[str], None] = None,
+) -> DigestResult:
+    """执行确定性完全酶切；默认启用本次识别到的全部位点。
+
+    传入空可迭代对象表示显式不启用任何位点。旧的三参/位置调用保持兼容。
+    """
+    top, enzyme_list, circular = _prepare_inputs(sequence, enzymes, topology)
+    recognized = _recognize_validated(top, enzyme_list, topology)
+    enabled = _normalize_enabled_ids(enabled_site_ids, recognized)
+    selected = tuple(
+        site for site in recognized.sites
+        if enabled is None or site.site_id in enabled
+    )
+    n = recognized.length
+
     raw_sites: list[CutSite] = []
     # 物理末端键 (t mod n, b mod n) -> 固有 delta（环状必须唯一，否则歧义）
     phys: dict[tuple[int, int], int] = {}
@@ -456,32 +587,31 @@ def digest(
             bot_seen[b] = t
         return t, b
 
-    for enz in enzyme_list:
-        length = len(enz.recognition)
-        fwd = _pattern_sets(enz.recognition)
-        rc_pattern = _reverse_complement_iupac(enz.recognition)
-        # 回文识别串（如 GAATTC）在每个位置的反向命中就是同一次物理断裂，
-        # 不能重复计数；只有非回文酶才需要再扫反向互补。
-        scan_reverse = rc_pattern != enz.recognition
-        rev = _pattern_sets(rc_pattern)
-        a = enz.top_cut
-        c = enz.bottom_cut
-        for s in _scan(top, fwd, circular):
-            reg = register(s + a, s + c, c - a,
-                           f"酶 {enz.name!r} 正向位点 start={s}")
-            if reg is not None:
+    for site in selected:
+        enzyme = enzyme_list[site.enzyme_index]
+        scan_reverse = _reverse_complement_iupac(enzyme.recognition) != enzyme.recognition
+        registration_strands = site.strand_sources if scan_reverse else (
+            ("+",) if "+" in site.strand_sources else ("-",)
+        )
+        delta = enzyme.bottom_cut - enzyme.top_cut
+        observed_cuts: set[tuple[int, int]] = set()
+        for source_strand in registration_strands:
+            if source_strand == "+":
+                t_raw = site.start + enzyme.top_cut
+                b_raw = site.start + enzyme.bottom_cut
+            else:
+                t_raw = site.start + site.length - enzyme.bottom_cut
+                b_raw = site.start + site.length - enzyme.top_cut
+            reg = register(
+                t_raw, b_raw, delta,
+                f"酶 {site.enzyme!r} {source_strand} 位点 start={site.start}"
+            )
+            if reg is not None and reg not in observed_cuts:
                 t, b = reg
-                raw_sites.append(CutSite(enz.name, s, "+", t, b))
-        if scan_reverse:
-            for s in _scan(top, rev, circular):
-                # 反向互补命中：酶旋转 180°，上链 = s+L-b，下链 = s+L-a。
-                t_raw = s + length - c
-                b_raw = s + length - a
-                reg = register(t_raw, b_raw, c - a,
-                               f"酶 {enz.name!r} 反向互补位点 start={s}")
-                if reg is not None:
-                    t, b = reg
-                    raw_sites.append(CutSite(enz.name, s, "-", t, b))
+                observed_cuts.add(reg)
+                raw_sites.append(CutSite(
+                    site.enzyme, site.start, source_strand, t, b, site.site_id
+                ))
 
     raw_sites.sort(key=lambda x: (x.start, x.strand, x.enzyme))
     cut_sites = tuple(raw_sites)
@@ -499,7 +629,7 @@ def digest(
             top_strand=top, bottom_strand=bottom,
             left_end=None, right_end=None,
         )
-        return DigestResult(topology, n, cut_sites, (frag,))
+        return DigestResult(topology, n, cut_sites, (frag,), recognized.sites)
 
     # ---- 3. 末端排序列表（线性追加 0/N 平端分子末端）----
     if circular:
@@ -577,4 +707,4 @@ def digest(
             left_end=left, right_end=right,
         ))
 
-    return DigestResult(topology, n, cut_sites, tuple(fragments))
+    return DigestResult(topology, n, cut_sites, tuple(fragments), recognized.sites)

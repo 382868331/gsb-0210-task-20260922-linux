@@ -9,6 +9,7 @@ from restriction_digest import (
     Enzyme,
     compatible,
     digest,
+    recognize_sites,
 )
 
 
@@ -44,6 +45,27 @@ def main():
     print()
     can_recircularize = compatible(frag.right_end, frag.left_end)
     print(f"可拼接端型检查：右端 × 左端 -> {'可互补拼接（可重新环化）' if can_recircularize else '不可拼接'}")
+
+    print()
+    print("=" * 70)
+    print("确定性部分酶切：先识别全部物理位点，再只启用一个稳定 ID")
+    print("=" * 70)
+    seq2 = "AAAAGAATTCTTTT"
+    e_short = Enzyme("ShortOverhang", "GAATTC", 1, 3)
+    e_long = Enzyme("LongOverhang", "GAATTC", 1, 5)
+    recognition = recognize_sites(seq2, [e_short, e_long])
+    print(f"底物（线性）: {seq2}；两个酶识别同一物理区间，但下链切口不同")
+    for site in recognition.sites:
+        print(f"  识别位点: id={site.site_id}，酶={site.enzyme}，start={site.start}，" +
+              f"方向来源={'/'.join(site.strand_sources)}，匹配={site.matched_sequence}")
+    chosen = recognition.sites[0]
+    partial = digest(seq2, [e_short, e_long], enabled_site_ids=[chosen.site_id])
+    cut = partial.cut_sites[0]
+    print(f"仅启用 {chosen.enzyme}: 上链切口 {cut.top_boundary}，下链切口 {cut.bottom_boundary}")
+    for fragment in partial.fragments:
+        print(f"  片段{fragment.index}: 上链 {fragment.top_strand} / 下链 {fragment.bottom_strand}")
+    empty = digest(seq2, [e_short, e_long], enabled_site_ids=())
+    print(f"空启用集合：{len(empty.cut_sites)} 个切口，{len(empty.fragments)} 个未切片段")
 
     # 再附一个平端线性小例，直观对照端型。
     smai = Enzyme("SmaI", "CCCGGG", 3, 3)
