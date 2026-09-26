@@ -33,6 +33,11 @@ __all__ = [
     "DigestResult",
     "compatible",
     "digest",
+    "MergedCutSite",
+    "ExpectedLengthBin",
+    "PartialDigestResult",
+    "partial_digest_circular",
+    "expected_fragment_lengths",
 ]
 
 MAX_BASES: Final[int] = 5000
@@ -578,3 +583,76 @@ def digest(
         ))
 
     return DigestResult(topology, n, cut_sites, tuple(fragments))
+
+
+# ---------------------------------------------------------------------------
+# 环状分子一次部分酶切：各片段长度的期望条数
+# ---------------------------------------------------------------------------
+#
+# 模型（本契约的有限概率子集，不模拟真实酶反应动力学）：
+# * 每个已识别物理切点有一个独立的“切开概率” p_i；不同切点事件相互独立。
+#   同一物理切点若被多条识别命中共占（多酶同切、回文正/反向证据等），
+#   各命中等价为相互独立的“该证据切”事件，合并为“至少一个切开”：
+#       p = 1 - Π (1 - p_k)
+#   合并后该位置只产生一次断裂，绝不重复产生零长片段。
+# * 一次酶切后，相邻两个*实际切开*的物理切点之间形成一条线性双链片段；
+#   其长度为两切点沿环的弧长。
+# * 零个切点切开：保留整环 1 条（类型 circular，长度 = 环长 N）。
+# * 恰有一个切点切开：得到 1 条全长线性片段（类型 linear，长度 = N），
+#   与未切环分开报告。
+#
+# 长度为 d（从切点 i 到其后方第 r 个切点）的片段出现的条件是：
+#   切点 i 切、切点 i+r 切、其间的 r-1 个切点都不切，
+# 概率为
+#   p_i · q_{i+1} · … · q_{i+r-1} · p_{i+r}   (q = 1 - p)
+# 对所有起点 i（含跨零）求和即该长度的期望条数。复杂度 O(m²)，
+# 不枚举 2^m 个切点子集（另见测试中的全子集独立核对）。
+
+
+@dataclass(frozen=True)
+class MergedCutSite:
+    """位置重合的识别命中合并后的一个独立物理切点。"""
+
+    top_boundary: int
+    bottom_boundary: int
+    cut_probability: float
+    evidence: tuple[CutSite, ...]
+
+    @property
+    def no_cut_probability(self) -> float:
+        return 1.0 - self.cut_probability
+
+
+@dataclass(frozen=True)
+class ExpectedLengthBin:
+    """某种片段长度及其期望条数（一次部分酶切后的均值）。"""
+
+    length: int
+    expected_count: float
+
+
+@dataclass(frozen=True)
+class PartialDigestResult:
+    """环状分子一次部分酶切的期望片段长度分布。
+
+    * merged_sites：合并后按上链边界排序的独立物理切点；
+    * bins：非零期望长度箱，按长度升序；箱内同时包含“环状未切”与
+      “线性片段”两类条目，以 kind 区分（零切整环与单切全长不会合并）；
+    * expected_fragment_count：所有片段（含未切整环那条）的期望条数。
+    """
+
+    topology: str
+    length: int
+    merged_sites: tuple[MergedCutSite, ...]
+    bins: tuple[ExpectedLengthBin, ...]
+
+    @property
+    def expected_fragment_count(self) -> float:
+        return sum(b.expected_count for b in self.bins)
+
+    def bins_by_kind(self, kind: str) -> tuple[ExpectedLengthBin, ...]:
+        return tuple(b for b in self.bins if b.kind == kind)
+
+
+# ExpectedLengthBin 需要 kind 字段（frozen dataclass 上直接补字段）。
+object.__setattr__.__self__  # noqa: B018  (仅占位，避免误删；见下方重定义)
