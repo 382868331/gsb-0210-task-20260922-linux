@@ -8,15 +8,18 @@
 * 片段按上链切口排序（环状循环排序，线性追加分子两端 0/N 的平端边界）。
 * 当交错切口导致片段无法做无交叉的简单归属时，抛出
   :class:`DigestUnsupportedError`，绝不猜测配对。
+* :func:`partial_digest_expectation` 另提供环状分子一次部分酶切的概率期望；
+  该接口使用浮点概率与期望条数。
 
-全部计算均为整数运算，没有浮点输出，因此不存在误差口径/容差问题。
+完全酶切几何归属全部计算均为整数运算，没有浮点输出；部分酶切概率接口的
+浮点结果遵循 IEEE 双精度普通舍入，测试只检查正常有限概率下的近似守恒。
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Final, Iterable, Union
+from typing import Callable, Final, Iterable, Sequence, Union
 
 __all__ = [
     "MAX_BASES",
@@ -31,8 +34,12 @@ __all__ = [
     "Fragment",
     "CutSite",
     "DigestResult",
+    "MergedCutSite",
+    "ExpectedFragment",
+    "PartialDigestExpectation",
     "compatible",
     "digest",
+    "partial_digest_expectation",
 ]
 
 MAX_BASES: Final[int] = 5000
@@ -239,6 +246,42 @@ class DigestResult:
         return len({(s.top_boundary, s.bottom_boundary) for s in self.cut_sites})
 
 
+@dataclass(frozen=True)
+class MergedCutSite:
+    """位置重合的多个识别命中按独立事件合并后的实际切点。"""
+
+    top_boundary: int
+    bottom_boundary: int
+    probability: float
+    evidence: tuple[CutSite, ...]
+
+
+@dataclass(frozen=True)
+class ExpectedFragment:
+    """某个长度与类型的片段在一次部分酶切后的期望条数。"""
+
+    length: int
+    kind: str  # "circular" 为零切开整环；"linear" 为至少一个切开后的线性片段
+    expected_count: float
+
+
+@dataclass(frozen=True)
+class PartialDigestExpectation:
+    """环状分子一次独立随机部分酶切的片段长度期望分布。"""
+
+    length: int
+    merged_cut_sites: tuple[MergedCutSite, ...]
+    expected_fragments: tuple[ExpectedFragment, ...]
+
+    @property
+    def expected_total_length(self) -> float:
+        """各长度期望条数乘以长度之和；应在浮点舍入误差内等于环长。"""
+        return sum(
+            fragment.length * fragment.expected_count
+            for fragment in self.expected_fragments
+        )
+
+
 # ---------------------------------------------------------------------------
 # 核心算法
 # ---------------------------------------------------------------------------
@@ -351,6 +394,23 @@ def compatible(left: Union[EndInfo, None], right: Union[EndInfo, None]) -> bool:
     if right.kind != left.kind or right.overhang_length != left.overhang_length:
         return False
     return _revcomp_concrete(right.overhang) == left.overhang
+
+
+def _check_probability(value: object, site: CutSite) -> float:
+    """把单个识别切点的切开概率校验为 [0, 1] 内的有限浮点数。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise DigestError(
+            "切点概率必须是 int 或 float，"
+            f"收到 {type(value).__name__}: {site}"
+        )
+    probability = float(value)
+    if not math.isfinite(probability):
+        raise DigestError(f"切点概率必须有限，收到 {value}: {site}")
+    if not 0.0 <= probability <= 1.0:
+        raise DigestError(
+            f"切点概率必须在 [0, 1] 内，收到 {probability}: {site}"
+        )
+    return probability
 
 
 # 内部用的“物理末端”：去重后的 (上链边界, 下链边界, 固有错位)。
@@ -578,3 +638,150 @@ def digest(
         ))
 
     return DigestResult(topology, n, cut_sites, tuple(fragments))
+
+
+def _resolve_probabilities(
+    cut_sites: Sequence[CutSite],
+    cut_probabilities: Union[
+        float,
+        Callable[[CutSite], float],
+        Sequence[Union[int, float]],
+    ],
+) -> tuple[float, ...]:
+    if isinstance(cut_probabilities, (int, float)):
+        return tuple(
+            _check_probability(cut_probabilities, site) for site in cut_sites
+        )
+    if callable(cut_probabilities):
+        return tuple(
+            _check_probability(cut_probabilities(site), site)
+            for site in cut_sites
+        )
+    try:
+        values = tuple(cut_probabilities)
+    except TypeError as exc:
+        raise DigestError(
+            "cut_probabilities 必须是概率数值、按 CutSite 返回概率的可调用对象，"
+            "或与识别切点等长的概率序列"
+        ) from exc
+    if len(values) != len(cut_sites):
+        raise DigestError(
+            f"概率序列长度 {len(values)} 与识别切点数 {len(cut_sites)} 不一致"
+        )
+    return tuple(
+        _check_probability(value, site)
+        for value, site in zip(values, cut_sites, strict=True)
+    )
+
+
+def _merge_cut_probabilities(
+    cut_sites: Sequence[CutSite],
+    probabilities: Sequence[float],
+) -> tuple[MergedCutSite, ...]:
+    """同一物理切点上的多个识别命中按“至少一个切开”合并。"""
+    grouped: dict[tuple[int, int], list[tuple[CutSite, float]]] = {}
+    for site, probability in zip(cut_sites, probabilities, strict=True):
+        key = (site.top_boundary, site.bottom_boundary)
+        grouped.setdefault(key, []).append((site, probability))
+
+    merged: list[MergedCutSite] = []
+    for (top_boundary, bottom_boundary), members in grouped.items():
+        no_cut_probability = 1.0
+        for _site, probability in members:
+            no_cut_probability *= 1.0 - probability
+        merged.append(MergedCutSite(
+            top_boundary=top_boundary,
+            bottom_boundary=bottom_boundary,
+            probability=1.0 - no_cut_probability,
+            evidence=tuple(site for site, _probability in members),
+        ))
+    merged.sort(key=lambda site: site.top_boundary)
+    return tuple(merged)
+
+
+def partial_digest_expectation(
+    sequence: str,
+    enzymes: Union[Enzyme, Iterable[Enzyme]],
+    cut_probabilities: Union[
+        float,
+        Callable[[CutSite], float],
+        Sequence[Union[int, float]],
+    ],
+    topology: str = "circular",
+) -> PartialDigestExpectation:
+    """计算环状分子一次独立随机部分酶切后的片段长度期望条数。
+
+    每个识别命中先赋予独立切开概率；坐标完全重合的多个命中按
+    ``1 - ∏(1-p_i)`` 合并为“至少一个切开”的实际切点。合并后切点仍视为
+    相互独立。结果按 ``(片段长度, 类型)`` 聚合：零切开保留长度 N 的整环，
+    只切一次产生长度 N 的全长线性片段，两者分别报告。
+
+    计算只遍历环上有序切点对，复杂度 O(m²)，不枚举所有切点子集。
+    """
+    if isinstance(topology, bool) or topology != "circular":
+        raise DigestError("partial_digest_expectation 当前仅支持 topology='circular'")
+
+    complete = digest(sequence, enzymes, topology=topology)
+    probabilities = _resolve_probabilities(complete.cut_sites, cut_probabilities)
+    merged = _merge_cut_probabilities(complete.cut_sites, probabilities)
+    n = complete.length
+    m = len(merged)
+    expected: dict[tuple[int, str], float] = {}
+
+    def add(length: int, kind: str, value: float) -> None:
+        if value:
+            expected[(length, kind)] = expected.get((length, kind), 0.0) + value
+
+    no_cut_probability = 1.0
+    cut_probability_values = tuple(site.probability for site in merged)
+    for probability in cut_probability_values:
+        no_cut_probability *= 1.0 - probability
+    add(n, "circular", no_cut_probability)
+
+    if m >= 1:
+        prefix_no_cut: list[float] = [1.0] * (m + 1)
+        suffix_no_cut: list[float] = [1.0] * (m + 1)
+        for i, probability in enumerate(cut_probability_values):
+            prefix_no_cut[i + 1] = prefix_no_cut[i] * (1.0 - probability)
+        for i in range(m - 1, -1, -1):
+            suffix_no_cut[i] = suffix_no_cut[i + 1] * (
+                1.0 - cut_probability_values[i]
+            )
+
+        # 恰好一个切点切开：该切点切、其余所有切点均不切。
+        for i, site in enumerate(merged):
+            add(
+                n,
+                "linear",
+                site.probability * prefix_no_cut[i] * suffix_no_cut[i + 1],
+            )
+
+    if m >= 2:
+        # 一段弧成为片段，当且仅当首尾两个实际切点切开、其间沿环的其他
+        # 实际切点均未切；环外切点是否切开不影响这段弧的产生。
+        for i, start_site in enumerate(merged):
+            interior_no_cut = 1.0
+            for step in range(1, m):
+                j = (i + step) % m
+                end_site = merged[j]
+                length = (end_site.top_boundary - start_site.top_boundary) % n
+                add(
+                    length,
+                    "linear",
+                    start_site.probability
+                    * end_site.probability
+                    * interior_no_cut,
+                )
+                interior_no_cut *= 1.0 - end_site.probability
+
+    fragments = tuple(
+        ExpectedFragment(length=length, kind=kind, expected_count=count)
+        for (length, kind), count in sorted(
+            expected.items(), key=lambda item: (item[0][0], item[0][1])
+        )
+    )
+    return PartialDigestExpectation(
+        length=n,
+        merged_cut_sites=merged,
+        expected_fragments=fragments,
+    )
